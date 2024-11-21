@@ -280,7 +280,8 @@ final_data <- ml_data %>%
 library(corrr)
 correlation_matrix <- final_data %>%
   correlate()
-rplot(correlation_matrix)
+rplot(correlation_matrix) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
 ggsave("corr_plot.png", 
        width = 20, height = 15, units = "cm", bg="white")
