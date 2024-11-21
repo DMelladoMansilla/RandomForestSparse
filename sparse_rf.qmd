@@ -1,0 +1,291 @@
+---
+title: "Random forest analysis for SPARSE data"
+author: "Daniela Mellado-Mansilla & Gabriel Ortega-Solis"
+format:
+    html:
+      toc-title: Table of contents
+      toc: true
+      toc-depth: 4
+      number-sections: false
+      highlight-style: github
+      toc-location: left
+      cap-location: top
+      page-layout: full
+      embed-resources: true
+      self-contained-math: true
+      toc-expand: true
+output: 
+  html_document: 
+  output_file: index.html
+editor: visual
+execute: 
+  eval: false
+---
+
+## Random Forest analysis for Czech birds
+
+This code was used to perform a Random forest analysis to determine which variables (i.e., climate, time, area, etc) influence the bird species richness. The information on birds species used in this code are available at [SPARSE](https://bdj.pensoft.net/article/108731/) database:
+
+[![SPARSE database, Tschernosterová et al. 2023](oo_860627.png)](https://bdj.pensoft.net/article/108731/element/8/185577//)
+
+# Libraries
+
+```{r}
+pacman::p_load(tidymodels, tidyverse, future, doRNG,GGally, tictoc, pdp,foreach,doParallel, ranger, caret, GGally,ggcorrplot, corrr)
+```
+
+## Data
+
+```{r}
+sparse<-read.csv("sparse_rich_env.csv")%>% 
+  select(., !objectID)
+
+colnames(sparse)<-colnames(sparse)%>% 
+  str_replace_all(.," ", "_")%>% 
+  str_replace_all(.,"-", "_")%>%
+  str_replace_all(.,",", "_")
+names(sparse)
+
+# count the number of spp per comb_id
+species_count <- sparse %>%
+  select(.,comb_ID, species) %>%
+  group_by(comb_ID) %>%
+  summarise(richness = n())
+
+#select only the environmental variables
+datos_var<- sparse %>%
+  select(.,comb_ID, 3:9,11:19, 21:48) %>%
+  unique()
+
+
+# merge both data setssparse2 <- left_join(species_count,datos_var, by = "comb_ID")%>%
+  unique()
+names(sparse2) <- gsub("\\.", "_", names(sparse2))
+
+```
+
+# Ramdom forest
+
+## Model settings
+
+```{r}
+predictors<-c("tas", "start_year", "time_span", "AREA2", "lon", "lat", "Broad_leaved_forest", "Complex_cultivation_patterns", "Coniferous_forest", "Construction_sites", "Discontinuous_urban_fabric", "Green_urban_areas", "Industrial_or_commercial_units", "Land_principally_occupied_by_agriculture__with_significant_areas_of_natural_vegetation", "Mixed_forest", "Moors_and_heathland", "Natural_grasslands", "Pastures", "Sparsely_vegetated_areas", "Transitional_woodland_shrub", "Water_bodies", "median_ndvi", "Protected_area")
+
+responses<-"richness"
+
+split_prop<-3/4
+ml_engine<-"ranger"
+ml_mode<-"regression"
+ml_metrics<-metric_set(rmse, rsq, mae)
+```
+
+## Tuning parameters:
+
+```{r}
+tuning_params<- expand.grid(
+  mtry=c(5, 7,10,15,20, 25, 30), #number predictors
+  trees=c(500,1000,1500, 2000, 2500, 3000),
+  min_n=c(2,5)# Minimum number of samples required to split an internal node
+)
+```
+
+## Data preparation
+
+```{r}
+ml_data<-select(sparse2,any_of(c(responses, predictors)))%>%
+  mutate(across(everything(),~replace_na(.,0)))
+
+```
+
+## Preparing training and testing data
+
+```{r}
+set.seed(9872345)
+ml_split<-initial_split(ml_data, prop = split_prop)
+
+ml_split
+```
+
+## Create a cross-validation set for later use
+
+```{r}
+ml_cv<- vfold_cv(training(ml_split))
+```
+
+## Create recipe
+
+```{r}
+
+#https://recipes.tidymodels.org/articles/Ordering.html
+
+formula <- as.formula(paste(responses, paste(predictors, collapse = "+"), sep = "~"))
+
+ml_recipe <- recipe(formula, data = ml_data) %>%
+  # Pre-processing steps
+  ## Transform numeric predictors
+  step_YeoJohnson(all_numeric()) %>%
+  ## Recode categorical variables
+  #step_dummy(time_inter) %>%
+  ## Standardize all numeric columns
+  step_normalize(all_numeric()) %>%
+  # Remove NAs
+  step_naomit()
+```
+
+# Create the model
+
+```{r}
+rf_model <- 
+  # specify that the model is a random forest
+  rand_forest() %>%
+  # Parameters to be tuned
+  set_args(mtry = tune(),
+           trees = tune(),
+           min_n = tune()) %>%
+  # Select the modeling engine
+  set_engine(engine = ml_engine, importance = "impurity") %>%
+  # Select between regression and binary classification
+  set_mode(ml_mode)
+```
+
+## Create a workflow
+
+```{r}
+rf_workflow <- workflow() %>%
+  # add the recipe
+  add_recipe(ml_recipe) %>%
+  # add the model
+  add_model(rf_model)
+
+```
+
+## Tune parameters
+
+```{r}
+plan("future::multisession")
+
+tic()
+# extract results
+rf_tune_results <- rf_workflow %>%
+  tune_grid(resamples = ml_cv, #Cross-validation data object
+            # Grid of hyperparameters
+            grid = tuning_params, 
+            # Metrics to evaluate
+            metrics = ml_metrics
+            )
+toc()
+#105.636 sec elapsed
+
+```
+
+## Plot tunned parameters
+
+```{r}
+autoplot(rf_tune_results) 
+
+```
+
+![](rftune.png)
+
+## Collect and evaluate results
+
+```{r}
+rf_tune_results %>%
+  collect_metrics()
+```
+
+## The very best of tunning
+
+```{r}
+param_final <- rf_tune_results %>%
+  select_best(metric = "rmse")
+
+print(param_final)
+
+```
+
+## Finalize workflow
+
+```{r}
+rf_workflow <- rf_workflow %>%
+  finalize_workflow(param_final)
+```
+
+# Fit the final model to the training and testing data
+
+```{r}
+rf_fit <- rf_workflow %>%
+  # fit on the training set and evaluate on test set
+  last_fit(ml_split)
+```
+
+check results
+
+```{r}
+test_performance <- rf_fit %>% collect_metrics()
+test_performance
+
+#rmse 0.5809
+#rsq 0.5920
+```
+
+```{r}
+
+library(vip)
+f_model <- extract_fit_parsnip(rf_fit)
+
+# Plot variable importance
+importance_scores<-vip(f_model$fit,  num_features = 15,geom = "col")
+importance_scores
+
+importance_scores$data <- importance_scores$data %>%
+  mutate(Variable = ifelse(Variable == "Land_principally_occupied_by_agriculture__with_significant_areas_of_natural_vegetation", 
+                           "Agr_NatVeg", Variable))
+
+
+# Define a custom color scale with blue shades
+blue_shades <- colorRampPalette(c("lightblue", "darkblue"))(15)
+
+# Plot with custom blue shades
+ggplot(importance_scores$data, aes(x = reorder(Variable, Importance), y = Importance, fill = Importance)) +
+  geom_col() +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Variable Importance Plot", x = "Variables", y = "Importance")
+
+ggsave("variable_importance_plot.png", 
+       width = 15, height = 10, units = "cm", bg="white")
+```
+
+![](variable_importance_plot.png)
+
+## Check correlations
+
+```{r}
+save.image("after_rf.RData")
+
+ml_data <- ml_data %>%
+  rename(Agr_NatVeg = Land_principally_occupied_by_agriculture__with_significant_areas_of_natural_vegetation)
+
+top_predictors <- importance_scores$data$Variable
+print(top_predictors)
+
+top_predictors <- top_predictors %>%
+  str_replace("Land_principally_occupied_by_agriculture__with_significant_areas_of_natural_vegetation", "Agr_NatVeg")
+
+final_data <- ml_data %>%
+  select(all_of(top_predictors))
+
+library(corrr)
+correlation_matrix <- final_data %>%
+  correlate()
+rplot(correlation_matrix)
+
+ggsave("corr_plot.png", 
+       width = 20, height = 15, units = "cm", bg="white")
+```
+
+## ![](corr_plot.png)
+
+This code is still under construction...
